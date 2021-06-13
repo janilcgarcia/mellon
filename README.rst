@@ -7,6 +7,8 @@ mellon
 create dictionary of known words from the text corpus of your choice as well
 to generate secure pass phrases from those words.
 
-"Why passphrases?" you may ask. Well, this explains better:
+"Why passphrases?" you may ask. Well, xkcd explains better:
 
 .. image:: https://imgs.xkcd.com/comics/password_strength.png
+
+`https://xkcd.com/936/`
