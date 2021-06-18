@@ -16,6 +16,7 @@
            [org.bouncycastle.crypto.prng
             SP800SecureRandom
             SP800SecureRandomBuilder]
+           [org.bouncycastle.crypto.modes OFBBlockCipher]
            [javax.crypto Cipher]
            [javax.crypto.spec SecretKeySpec IvParameterSpec]))
 
@@ -209,47 +210,96 @@
      (secure-random-byte-generator sp800))))
 
 ;; AES OFB
-(defn- aes-derive-key
+(defn- cipher-derive-key
   "The AES generator must use a 32 bytes key (it uses a AES-256 block). This
   function transforms a bigger than 32 bytes seed into a 32 bytes key if
   necessary."
-  [seed]
-  (SecretKeySpec.
-   (cond
-     (< (count seed) 32) (throw (ex-info (str "Seed is too weak, there must"
-                                              "be at least 32 bytes of "
-                                              "entropy")
-                                         {}))
-     (= (count seed) 32) (byte-array seed)
-     :otherwise (blake2b seed 32))
-   "AES"))
+  [seed keylen]
+  (cond
+    (< (count seed) keylen) (throw (ex-info (str "Seed is too weak, there must"
+                                                 "be at least " keylen
+                                                 " bytes of entropy")
+                                            {}))
+    (= (count seed) keylen) (byte-array seed)
+    :otherwise (blake2b seed keylen)))
 
-(def ^:private aes-default-iv
+(def ^:private cipher-default-iv
   "Default IV for initializaing the AES byte generator, in case no salt is
   provided"
   (byte-array
    [0x67 0xC7 0xBA 0xE3 0x11 0x6B 0x35 0xD0
     0x43 0xB7 0x3E 0xA2 0xC0 0x08 0x0D 0x38]))
 
-(defn- aes-derive-iv
+(defn- cipher-derive-iv
   "Derives an AES IV from a salt, in case one is present or returns the default
   IV"
-  [salt]
-  (IvParameterSpec. (if (nil? salt)
-                      aes-default-iv
-                      (blake2b salt 16))))
+  [salt block-size]
+  (if (nil? salt)
+    (byte-array (take block-size cipher-default-iv))
+    (blake2b salt block-size)))
 
-(def ^:private aes-default-block
+(def ^:private cipher-default-block
   "Block encrypted in the AES byte-generator"
   (byte-array
    [0xE9 0x43 0xDD 0x0E 0x05 0x7E 0x8E 0xB7
     0xA2 0x96 0x3B 0xFD 0xA4 0x0E 0xF9 0x12]))
 
-(defn- aes-generate-state
-  [cipher]
-  (fn [[bytes count]]
-    (.update cipher aes-default-block 0 16 bytes 0)
-    bytes))
+(defn- jce-aes-engine
+  "BouncyCastle BlockCipher implementation delegating to the JCE default
+  implementation which can take advantage of AES-NI in many settings.
+
+  Uses the default ECB with no padding algorithm to process blocks, but allows
+  the usage of the OFB mode from BouncyCastle which works as a stream cipher
+  instead of the default JCE one which works in blocks or truncate blocks."
+  []
+  (let [jce-aes (atom [nil nil])
+        get-aes (fn [] (first @jce-aes))]
+    (reify
+      org.bouncycastle.crypto.BlockCipher
+      (getAlgorithmName [this] "AES")
+      (getBlockSize [this] 16)
+      (init [this encryption params]
+        (let [opmode (if encryption
+                       Cipher/ENCRYPT_MODE
+                       Cipher/DECRYPT_MODE)
+              key-spec (SecretKeySpec. (.getKey params) "AES")]
+          (swap! jce-aes (fn [[cipher params]]
+                           (if-not (nil? cipher)
+                             (do
+                               (.init cipher opmode key-spec)
+                               [cipher [opmode key-spec]])
+                             [(doto (Cipher/getInstance "AES/ECB/NoPadding")
+                                (.init opmode key-spec))
+                              [opmode key-spec]])))))
+      (processBlock [this in in-offset out out-offset]
+        (.update (get-aes) in in-offset 16 out out-offset))
+      (reset [this]
+        (when-not (nil? (get-aes))
+          (swap! jce-aes (fn [[_ [opmode key-spec]]]
+                           [(doto (Cipher/getInstance "AES/ECB/NoPadding")
+                              (.init opmode key-spec))
+                            [opmode key-spec]])))))))
+
+(defn- block-cipher-byte-generator
+  "Base byte generator based on block cipher"
+  [cipher key-size seed salt]
+  (let [key (cipher-derive-key seed key-size)
+        iv (cipher-derive-iv salt (.getBlockSize cipher))
+        cipher (doto (OFBBlockCipher. cipher (* 8 (.getBlockSize cipher)))
+                 (.init true (ParametersWithIV. (KeyParameter. key) iv)))]
+
+    (fn [nbytes]
+       (let [bytes (byte-array nbytes)]
+         (loop [offset 0]
+           (let [nbytes-diff (- nbytes offset)
+                 step-nbytes (if (> nbytes-diff 16)
+                               16
+                               nbytes-diff)]
+             (if (>= offset nbytes)
+               (vec bytes)
+               (do
+                 (.processBytes cipher cipher-default-block 0 step-nbytes bytes offset)
+                 (recur (+ offset step-nbytes))))))))))
 
 (defn aes-byte-generator
   "Creates a byte-generator based on the AES block cipher on OFB mode, which
@@ -260,30 +310,7 @@
   works as an alternative for the hash-based generators up there, Blake2Xs and
   SP800 should be preferred."
   ([seed] (aes-byte-generator seed nil))
-  ([seed salt]
-   (let [key (aes-derive-key seed)
-         iv (aes-derive-iv salt)
-         cipher (doto (Cipher/getInstance "AES/OFB/NoPadding")
-               (.init Cipher/ENCRYPT_MODE key iv))]
-
-     (let [state (atom [(byte-array 16) 0])]
-       (swap! state (fn [_]
-                      (let [bytes (byte-array 16)]
-                        (.update cipher aes-default-block 0 16 bytes 0)
-                        (vec bytes))))
-
-       (fn [nbytes]
-         (let [bytes (byte-array nbytes)]
-           (loop [offset 0]
-             (let [nbytes-diff (- nbytes offset)
-                   step-nbytes (if (> nbytes-diff 16)
-                                 16
-                                 nbytes-diff)]
-               (if (>= offset nbytes)
-                 (vec bytes)
-                 (do
-                   (.processBytes ofb aes-default-block 0 step-nbytes bytes offset)
-                   (recur (+ offset step-nbytes))))))))))))
+  ([seed salt] (block-cipher-byte-generator (jce-aes-engine) 32 seed salt)))
 
 ;; XOF generators
 (defn- xof-byte-generator
