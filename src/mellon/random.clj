@@ -16,8 +16,8 @@
            [org.bouncycastle.crypto.prng
             SP800SecureRandom
             SP800SecureRandomBuilder]
-           [org.bouncycastle.crypto.modes OFBBlockCipher]
-           [org.bouncycastle.crypto.engines AESEngine]))
+           [javax.crypto Cipher]
+           [javax.crypto.spec SecretKeySpec IvParameterSpec]))
 
 ;; Utility functions
 (defn- bits->long
@@ -141,7 +141,7 @@
 
 (def system-byte-generator
   "System RNG device-based byte-generator, should be used by default"
-  (secure-random-byte-generator default-secure-random))
+  (secure-random-byte-generator system-random))
 
 ;; SP800
 (def ^:private sp800-salt
@@ -149,38 +149,38 @@
   (byte-array [0x95 0xf5 0xe7 0x75 0x2e 0x11 0x2c 0x64
                0xc6 0x5f 0xef 0x9e 0x39 0x09 0x46 0x38]))
 
+
 (defn- fixed-entropy-source
   "An entropy source which only provide the given seed in chunks of n bits"
   [n seed]
-  (let [seed-ref (ref (vec seed))]
+  ;; Uses atom for mutability
+  (let [seed-atom (atom (vec seed))]
     (reify
       org.bouncycastle.crypto.prng.EntropySource
       (entropySize [self] (int n))
       (getEntropy [self]
-        (dosync 
-         (let [nbytes (int (/ (+ n 7) 8))
-               entropy (take nbytes @seed-ref)]
-           (ref-set seed-ref (drop nbytes @seed-ref))
-           (if (= (count entropy) nbytes)
-             (byte-array entropy)
-             (throw (ex-info "No more entropy available" {}))))))
+        (let [nbytes (int (/ (+ n 7) 8))
+              entropy (take nbytes @seed-atom)]
+          (if (= (count entropy) nbytes)
+            (do
+              (swap! seed-atom (partial drop nbytes))
+              (byte-array entropy))
+            (throw (ex-info "No more entropy available" {})))))
       (isPredictionResistant [self] (boolean true)))))
 
 (defn- fixed-entropy-source-provider
   "An entropy source provider that creates ONE fixed-entropy-source"
   [seed]
-  (let [seed-ref (ref seed)]
+  (let [seed-atom (atom seed)]
     (reify
       org.bouncycastle.crypto.prng.EntropySourceProvider
       (get [self nbits]
-        (dosync
-         (let [s @seed-ref]
-           (if (nil? s)
-             (throw (ex-info (str "Not more entropy available, "
-                                  "this provider can be called only once")))
-             (do
-               (ref-set seed-ref nil)
-               (fixed-entropy-source nbits s)))))))))
+        (let [[s _] (swap-vals! seed-atom (fn [_] nil))]
+          (if (nil? s)
+            (throw (ex-info (str "Not more entropy available, "
+                                 "this provider can be called only once")))
+
+            (fixed-entropy-source nbits s)))))))
 
 (defn sp800-byte-generator
   "Byte-generator based on the SP800-90A DRBG, but only provides as an entropy
@@ -214,12 +214,15 @@
   function transforms a bigger than 32 bytes seed into a 32 bytes key if
   necessary."
   [seed]
-  (cond
-    (< (count seed) 32) (throw (ex-info (str "Seed is too weak, there must"
-                                             "be at least 32 bytes of entropy")
-                                        {}))
-    (= (count seed) 32) (byte-array seed)
-    :otherwise (blake2b seed 32)))
+  (SecretKeySpec.
+   (cond
+     (< (count seed) 32) (throw (ex-info (str "Seed is too weak, there must"
+                                              "be at least 32 bytes of "
+                                              "entropy")
+                                         {}))
+     (= (count seed) 32) (byte-array seed)
+     :otherwise (blake2b seed 32))
+   "AES"))
 
 (def ^:private aes-default-iv
   "Default IV for initializaing the AES byte generator, in case no salt is
@@ -232,15 +235,21 @@
   "Derives an AES IV from a salt, in case one is present or returns the default
   IV"
   [salt]
-  (if (nil? salt)
-    aes-default-iv
-    (blake2b salt 16)))
+  (IvParameterSpec. (if (nil? salt)
+                      aes-default-iv
+                      (blake2b salt 16))))
 
 (def ^:private aes-default-block
   "Block encrypted in the AES byte-generator"
   (byte-array
    [0xE9 0x43 0xDD 0x0E 0x05 0x7E 0x8E 0xB7
     0xA2 0x96 0x3B 0xFD 0xA4 0x0E 0xF9 0x12]))
+
+(defn- aes-generate-state
+  [cipher]
+  (fn [[bytes count]]
+    (.update cipher aes-default-block 0 16 bytes 0)
+    bytes))
 
 (defn aes-byte-generator
   "Creates a byte-generator based on the AES block cipher on OFB mode, which
@@ -254,22 +263,27 @@
   ([seed salt]
    (let [key (aes-derive-key seed)
          iv (aes-derive-iv salt)
-         param (ParametersWithIV. (KeyParameter. key) iv)
-         ofb (doto (OFBBlockCipher. (AESEngine.) 128)
-               (.init true param))]
+         cipher (doto (Cipher/getInstance "AES/OFB/NoPadding")
+               (.init Cipher/ENCRYPT_MODE key iv))]
 
-     (fn [nbytes]
-       (let [bytes (byte-array nbytes)]
-         (loop [offset 0]
-           (let [nbytes-diff (- nbytes offset)
-                 step-nbytes (if (> nbytes-diff 16)
-                               16
-                               nbytes-diff)]
-             (if (>= offset nbytes)
-               (vec bytes)
-               (do
-                 (.processBytes ofb aes-default-block 0 step-nbytes bytes offset)
-                 (recur (+ offset step-nbytes)))))))))))
+     (let [state (atom [(byte-array 16) 0])]
+       (swap! state (fn [_]
+                      (let [bytes (byte-array 16)]
+                        (.update cipher aes-default-block 0 16 bytes 0)
+                        (vec bytes))))
+
+       (fn [nbytes]
+         (let [bytes (byte-array nbytes)]
+           (loop [offset 0]
+             (let [nbytes-diff (- nbytes offset)
+                   step-nbytes (if (> nbytes-diff 16)
+                                 16
+                                 nbytes-diff)]
+               (if (>= offset nbytes)
+                 (vec bytes)
+                 (do
+                   (.processBytes ofb aes-default-block 0 step-nbytes bytes offset)
+                   (recur (+ offset step-nbytes))))))))))))
 
 ;; XOF generators
 (defn- xof-byte-generator
