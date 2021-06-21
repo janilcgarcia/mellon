@@ -6,6 +6,22 @@
             [mellon.generate :as m.gen]
             [mellon.random :as m.rand]))
 
+(defn- file-or-stdout
+  [file-name]
+  (if (= file-name "-")
+    *out*
+    (io/file file-name)))
+
+(defn- file?
+  [f]
+  (instance? java.io.File f))
+
+(defn- is-not-directory
+  [f]
+  (if (file? f)
+    (not (.isDirectory f))
+    true))
+
 (def generate-options
   [["-l" "--length LENGTH" "The length (in words of the generated passphrase"
     :default 5
@@ -21,34 +37,54 @@
 
 (def derive-options
   [["-o" "--output FILE" "Output dictionary file, must always be provide"
-    :parse-fn #(io/file %)
-    :validate [#(not (.isDirectory %1)) "This file is a directory, can't go on"]]])
+    :parse-fn file-or-stdout
+    :validate [is-not-directory "This file is a directory, can't go on"]]])
+
+(defn- validate-derive
+  [args]
+  (let [result (cli/parse-opts args derive-options)]
+    (when-let [errors (:errors result)]
+      (throw (ex-info (s/join "\n" errors)
+                      {:validation :derive
+                       :errors errors})))
+
+    (when-not (:output (:options result))
+      (throw (ex-info (str "You MUST provide an output file, it can be - to "
+                           "output to the stdout")
+                      {:validation :derive
+                       :missing :output})))
+
+    (when (empty? (:arguments result))
+      (throw (ex-info "You must provide at least one input"
+                      {:validation :derive
+                       :missing :inputs})))
+
+    {:output (:output (:options result))
+     :inputs (:arguments result)}))
 
 (defn- handle-derive
   [args]
-  (let [result (cli/parse-opts args derive-options)
-        errors (:errors result)
-        args (:arguments result)
-        opts (:options result)]
-    (if (nil? (:output opts nil))
-      (println "Nope"))
-    
-    (println errors)
-    (println (:summary result))
-    (println args)
-    (println opts)))
+  (let [validated (validate-derive args)
+        output (:output validated)
+        inputs (:inputs validated)]
+    (println "output:" output)
+    (println "inputs:" (s/join ", " inputs))
+    (println "This functionality is not implemented yet!")))
 
 (defn- validate-generate
   [args]
   (let [result (cli/parse-opts args generate-options)]
     (when (:errors result)
       (throw (ex-info (s/join "\n" (:errors result))
-                      {:validation :generate :errors (:errors result)})))
-    (when-not (:arguments result)
+                      {:validation :generate
+                       :errors (:errors result)})))
+
+    (when-not (empty? (:arguments result))
+      (println (:arguments result))
       (throw (ex-info "Generate don't take these additional parameters"
                       {:validation :generate :arguments (:arguments result)})))
 
-    (when-not (:dict (:options result))
+    (when-not (:dict (:options result) nil)
       (throw (ex-info (str "Generate NEEDs a dictionary file. Dict is not an "
                            "optional argument")
                       {:validation :generate
