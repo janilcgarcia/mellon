@@ -136,13 +136,13 @@
       (.nextBytes secure-random bytes)
       (vec bytes))))
 
-(def ^:private system-random
-  "Main secure-random, so users may use the default system one"
-  (secure-random))
+;; (def ^:private system-random
+;;   "Main secure-random, so users may use the default system one"
+;;   (secure-random))
 
-(def system-byte-generator
-  "System RNG device-based byte-generator, should be used by default"
-  (secure-random-byte-generator system-random))
+;; (def system-byte-generator
+;;   "System RNG device-based byte-generator, should be used by default"
+;;   (secure-random-byte-generator system-random))
 
 ;; SP800
 (def ^:private sp800-salt

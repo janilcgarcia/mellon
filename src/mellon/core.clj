@@ -95,7 +95,8 @@
 (defn- handle-generate
   [args]
   (let [options (validate-generate args)
-        pp-gen (m.gen/generate-passphrase m.rand/system-byte-generator
+        system-gen (m.rand/secure-random-byte-generator (m.rand/secure-random))
+        pp-gen (m.gen/generate-passphrase system-gen
                                           (m.gen/load-dict (:dict options)))]
     (dotimes [_ (:number options)]
       (println (pp-gen (:length options))))))
