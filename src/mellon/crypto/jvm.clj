@@ -7,256 +7,128 @@
            [java.security MessageDigest]
            [javax.crypto Mac]
            [javax.crypto.spec SecretKeySpec])
-  (:require [clojure.core.async :as async :refer [<! >! go-loop]]))
+  (:require [clojure.core.async :as async :refer [<! >! go-loop go chan close!]]
+            [mellon.crypto.core :as c.core]))
 
-(defn- spec-always-valid
-  [_]
-  true)
+(defn- make-digest-jca-api
+  [digest message]
+  (let [out (byte-array (.getDigestLength digest))]
+    (.digest (doto digest
+               (.update (byte-array message))))))
 
-(defn- spec-throw-ex
-  [ex]
-  (fn
-    [_]
-    (throw ex)))
-
-(defn- spec-validate-digest-size
-  [spec size]
-  (let [valid-size (:valid-digest-size spec spec-always-valid)]
-    (assert (valid-size size)
-            "Invalid size of digest output")))
-
-(defn- spec-prepare-key
-  [spec key]
-  (let [valid-key (:valid-key spec spec-always-valid)
-        derive-key (:derive-key spec (spec-throw-ex
-                                      (ex-info "Can't derive key"
-                                               {:derive-key :missing})))]
-    (if (valid-key key)
-      key
-      (derive-key key))))
-
-(defn- spec-prepare-salt
-  [spec salt]
-  (let [valid-salt (:valid-salt spec spec-always-valid)
-        derive-salt (:derive-salt spec (spec-throw-ex
-                                        (ex-info "Can't derive salt"
-                                                 {:derive-salt :missing})))]
-    (if (valid-salt salt)
-      salt
-      (derive-salt salt))))
-
-(defn- simple-hash
-  [spec message len]
-  (spec-validate-digest-size spec len)
-  (let [digest (byte-array len)
-        make-hasher (:factory spec)]
-    (doto
-        (make-hasher nil nil len)
+(defn- make-digest-bc-api
+  [digest message length]
+  (let [out (byte-array length)]
+    (doto digest
       (.update (byte-array message) 0 (count message))
-      (.doFinal digest 0))
-    digest))
+      (.doFinal out 0))
+    out))
 
-(defn- simple-keyed-hash
-  [spec key salt message len]
-  (spec-validate-digest-size spec len)
-  (let [make-hasher (:factory spec)
-        
-        key (spec-prepare-key spec key)
-        salt (spec-prepare-salt spec salt)
-        hasher (make-hasher key salt len)
+(defn- sync-keyed-blake2b
+  ([key message length]
+   (if (> (count key) 64)
+     (recur (sync-keyed-blake2b nil key 64) message length)
+     (-> (Blake2bDigest.
+          (if (nil? key)
+            nil
+            (byte-array key))
+          length nil nil)
+         (make-digest-bc-api message length)))))
 
-        digest (byte-array len)]
-    (doto
-        hasher
-      (.update (byte-array message) 0 (count message))
-      (.doFinal digest 0))
-    digest))
+(defn- sync-keyed-blake2s
+  ([key message length]
+   (if (> (count key) 32)
+     (recur (sync-keyed-blake2s nil key 32) message length)
+     (-> (Blake2sDigest.
+          (if (nil? key)
+            nil
+            (byte-array key))
+          length nil nil)
+         (make-digest-bc-api message length)))))
 
-(defn- jca-prefix-keyed-hash
-  [spec key salt message]
-  (let [make-hasher (:factory spec)
-        key (spec-prepare-key spec key)
-        salt (spec-prepare-salt spec key)]
-    (. (doto
-           (make-hasher key salt 0)
-         (.update (byte-array message) 0 (count message)))
-       digest)))
+(defn- keyed-blake2b
+  ([key message] (keyed-blake2b key message 64))
+  ([key message length]
+   (let [out (chan)]
+     (go
+       (>! out (sync-keyed-blake2b key message length))
+       (close! out))
+     out)))
 
-(defn- make-blake2b
-  ([len] (Blake2bDigest. len))
-  ([key salt len]
-   (Blake2bDigest. key len salt nil)))
+(defn- keyed-blake2s
+  ([key message] (keyed-blake2s key message 32))
+  ([key message length]
+   
+   (let [out-chan (chan)]
+     (go (>! out-chan (sync-keyed-blake2s key message length))
+         (close! out-chan))
+     out-chan)))
 
-(defn- make-blake2s
-  ([len] (Blake2sDigest. len))
-  ([key salt len]
-   (Blake2sDigest. key len salt nil)))
+(defn- hmac-sha2
+  [sha key message]
+  (let [out-chan (chan)
+        hmac-name (str "Hmac" sha)
+        hmac (doto
+                 (Mac/getInstance hmac-name)
+               (.init (SecretKeySpec. (byte-array key) hmac-name)))]
+    (go (>! out-chan (make-digest-bc-api hmac message (.getMacLength hmac)))
+        (close! out-chan))
+    out-chan))
 
-(def ^:private blake2b-spec
-  {:factory make-blake2b
-   :max-digest-size 64
-   :valid-digest-size #(<= 1 % 64)})
+(def ^:private hmac-sha2-512 (partial hmac-sha2 "SHA512"))
+(def ^:private hmac-sha2-256 (partial hmac-sha2 "SHA256"))
 
-(def ^:private blake2s-spec
-  {:factory make-blake2s
-   :max-digest-size 32
-   :valid-digest-size #(<= 1 % 32)})
+(defn- keyed-sha3
+  [len key message]
+  (let [out-chan (chan)
+        digest (doto
+                   (MessageDigest/getInstance (str "SHA3-" len))
+                 (.update (byte-array key)))]
+    (go
+      (>! out-chan (make-digest-jca-api digest message))
+      (close! out-chan))
+    out-chan))
 
-(defn- simple-blake2b
-  ([message] (simple-blake2b message (:max-digest-size blake2b-spec)))
-  ([message len]
-   (simple-hash blake2b-spec message len)))
 
-(defn- simple-blake2s
-  ([message] (simple-blake2s message (:max-digest-size blake2s-spec)))
-  ([message len]
-   (simple-hash blake2s-spec message len)))
+(def ^:private keyed-hashes
+  {:keyed-blake2b {:max-digest-size 64
+                   :fn keyed-blake2b}
+   :keyed-blake2s {:max-digest-size 32
+                   :fn keyed-blake2s}
+   :hmac-sha2-512 {:max-digest-size 64
+                   :fn hmac-sha2-512}
+   :hmac-sha2-256 {:max-digest-size 32
+                   :fn hmac-sha2-256}
+   :prefix-sha3-512 {:max-digest-size 64
+                     :fn (partial keyed-sha3 "512")}
+   :prefix-sha3-256 {:max-digest-size 32
+                     :fn (partial keyed-sha3 "256")}})
 
-(def ^:private keyed-blake2b-spec
-  {:factory make-blake2b
-   :max-digest-size 64
-   :valid-digest-size #(<= 1 % 64)
-   :valid-key #(<= 1 (count %) 64)
-   :derive-key #(simple-blake2b %)
-   :valid-salt #(or (nil? %1) (= (count %1) 16))
-   :derive-salt #(simple-blake2b % 16)})
+(defn get-keyed-hash
+  [hash]
+  (:fn (hash keyed-hashes)))
 
-(def ^:private keyed-blake2s-spec
-  {:factory make-blake2s
-   :max-digest-size 32
-   :valid-digest-size #(<= 1 % 64)
-   :valid-key #(<= 1 (count %) 32)
-   :derive-key #(simple-blake2s (count %))
-   :valid-salt #(or (nil? %1) (= (count %1) 8))
-   :derive-salt #(simple-blake2s % 8)})
+(def available-keyed-hashes
+  (vec (keys keyed-hashes)))
 
-(defn- simple-keyed-blake2b
-  ([key message]
-   (simple-keyed-blake2b key nil message (:max-digest-size keyed-blake2b-spec)))
-  ([key salt message]
-   (simple-keyed-blake2b key salt message (:max-digest-size keyed-blake2b-spec)))
-  ([key salt message len]
-   (simple-keyed-hash keyed-blake2b-spec key salt message len)))
+(def extended-keyed-hash (partial c.core/extended-keyed-hash-generator keyed-hashes))
 
-(defn- simple-keyed-blake2s
-  ([key message]
-   (simple-keyed-blake2s key nil message (:max-digest-size keyed-blake2s-spec)))
-  ([key salt message]
-   (simple-keyed-blake2s key salt message (:max-digest-size keyed-blake2s-spec)))
-  ([key salt message len]
-   (simple-keyed-hash keyed-blake2s-spec key salt message len)))
+(defn- secure-random
+  ([] (secure-random nil))
+  ([algo]
+   (if (nil? algo)
+     (java.security.SecureRandom.)
+     (java.security.SecureRandom/getInstance algo))))
 
-(defn- hmac-factory
-  [hmac-name]
-  (fn [key salt _]
-    (let [key (SecretKeySpec. (byte-array key) hmac-name)]
-      (doto
-          (Mac/getInstance hmac-name)
-        (.init key)
-        (when-not (nil? salt)
-          (.update (byte-array salt) 0 (count salt)))))))
+(defn system-random
+  ([] (make-system-random nil))
+  ([algo]
+   (let [r (secure-random algo)]
+     (fn [nbytes]
+       (let [bytes (byte-array nbytes)
+             out (chan)]
+         (.nextBytes r bytes)
+         (go (>! out bytes)
+             (close! out))
+         out)))))
 
-(defn- create-hmac-spec
-  [hash-name hmac-name]
-  (let [digest (MessageDigest/getInstance hash-name)
-        max-length (.getDigestLength digest)]
-    {:factory (hmac-factory hmac-name)
-     :max-digest-size max-length
-     :valid-digest-size #(= % max-length)}))
-
-(def ^:private hmac-sha2-512-spec
-  (create-hmac-spec "SHA-512" "HmacSHA512"))
-
-(def ^:private hmac-sha2-256-spec
-  (create-hmac-spec "SHA-256" "HmacSHA256"))
-
-(defn- simple-hmac-sha2-512
-  ([key message] (simple-hmac-sha2-512 key nil message))
-  ([key salt message]
-   (simple-keyed-hash hmac-sha2-512-spec key salt message
-                      (:max-digest-size hmac-sha2-512-spec))))
-
-(defn- simple-hmac-sha2-256
-  ([key message] (simple-hmac-sha2-256 key nil message))
-  ([key salt message]
-   (simple-keyed-hash hmac-sha2-256-spec key salt message
-                      (:max-digest-size hmac-sha2-256-spec))))
-
-(defn- make-sha3
-  ([digest-size]
-   (fn [key salt len]
-     (make-sha3 digest-size key salt len)))
-  ([digest-size key salt _]
-   (doto
-       (MessageDigest/getInstance (str "SHA3-" digest-size))
-     (.update key 0 (count key))
-     (when-not (nil? salt)
-       (.update salt 0 (count salt))))))
-
-(def ^:private prefix-sha3-512-spec
-  {:factory (make-sha3 "512")
-   :max-digest-size 64
-   :valid-digest-size #(= % 64)})
-
-(def ^:private prefix-sha3-256-spec
-  {:factory (make-sha3 "256")
-   :max-digest-size 32
-   :valid-digest-size #(= % 32)})
-
-(defn- simple-keyed-sha3-512
-  ([key message] (simple-keyed-sha3-512 key nil message))
-  ([key salt message]
-   (jca-prefix-keyed-hash prefix-sha3-512-spec key salt message)))
-
-(defn- simple-keyed-sha3-256
-  ([key message] (simple-keyed-sha3-256 key nil message))
-  ([key salt message]
-   (jca-prefix-keyed-hash prefix-sha3-256-spec key salt message)))
-
-(defn keyed-blake2b
-  [in out]
-  (go-loop []
-    (let [req (<! in)
-          key (:key req)
-          salt (:salt req)
-          msg (:message req)
-          len (:digestLength req 64)]
-      (>! out (simple-keyed-blake2b key msg len)))
-    (recur)))
-
-(defn hmac-sha2-512
-  [in out]
-  (go-loop []
-    (let [req (<! in)
-          key (:key req)
-          salt (:salt req)
-          msg (:message req)]
-      (>! out (simple-hmac-sha2-512 key msg)))))
-
-(defn- hash-extend
-  [spec]
-  (let [digest-size (:max-digest-size spec)
-        hash (:hash spec)]
-    (fn [key message len]
-      (let [nblocks (int (Math/ceil (/ len digest-size)))]
-        (loop [out []
-               generated 0
-               H (hash key (concat [0] message))]
-          (if (>= generated nblocks)
-            (take len out)
-            (recur
-             (concat out H)
-             (inc generated)
-             (hash key (concat [1] H)))))))))
-
-(defn hash-extend-hmac-sha2-512
-  [in out]
-  (let [hash (hash-extend {:max-digest-size 64
-                           :hash simple-hmac-sha2-512})]
-    (go-loop []
-      (let [req (<! in)
-            key (:key req)
-            message (:message req)
-            length (:length req)]
-        (>! out (hash key message length)))
-      (recur))))
