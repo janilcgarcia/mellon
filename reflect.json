@@ -1,0 +1,5 @@
+[{"name": "java.io.File",
+  "allPublicMethods": true},
+  
+ {"name": "java.lang.reflect.AccessibleObject",
+  "methods": [{"name":"canAccess"}]}]

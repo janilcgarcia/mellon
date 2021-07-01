@@ -136,6 +136,8 @@
       z/down
       z/right))
 
+;; (println (.getAbsolutePath (File. ".")))
+
 (let [file (zip-file-load "resources/samples/apologia.epub")
       all-content (epub-get-item-contents file)
       one-content (nth all-content 10)]
