@@ -4,7 +4,10 @@
             [clojure.java.io :as io]
             [clojure.string :as s]
             [mellon.generate :as m.gen]
-            [mellon.random :as m.rand]))
+            [mellon.random :as m.rand]
+            [clojure.core.async :as async :refer [<!!]]
+            [mellon.crypto.jvm :as crypto]
+            [mellon.utils :as utils]))
 
 (defn- file-or-stdout
   [file-name]
@@ -95,11 +98,12 @@
 (defn- handle-generate
   [args]
   (let [options (validate-generate args)
-        system-gen (m.rand/secure-random-byte-generator (m.rand/secure-random))
-        pp-gen (m.gen/generate-passphrase system-gen
-                                          (m.gen/load-dict (:dict options)))]
+        system-prbg (m.rand/->system-prbg (utils/fn-to-chan
+                                           (crypto/system-random)))
+        pp-gen (partial m.gen/generate-passphrase system-prbg
+                        (m.gen/load-dict (:dict options)))]
     (dotimes [_ (:number options)]
-      (println (pp-gen (:length options))))))
+      (println (<!! (pp-gen (:length options)))))))
 
 (defn -main
   [& args]

@@ -1,9 +1,10 @@
 (ns mellon.random
   (:require [clojure.core.async :as async :refer [go-loop go <! >! chan close!]])
-  (:require [mellon.native-utils :as native]))
+  (:require [mellon.native-utils :as native]
+            [mellon.utils :refer [bytes->long
+                                  int->bytes]]))
 
 ;; CSPRBGs
-
 (defn- connect-hash-prbg
   [in ext-hash seed salt]
   (let [salt (if (nil? salt)
@@ -56,28 +57,7 @@
       (>! gen-in nbytes))
     gen-out))
 
-(defn close-prbg
-  [prbg]
-  (let [[in _] prbg]
-    (close! in)))
-
 ;; Bit utility
-(defn- bytes->long
-  "Convert a big-endian bit vector into a long. "
-  [bs]
-  (reduce (fn [acc b]
-            (bit-or (bit-shift-left acc 8)
-                    (bit-and 0xFF b)))
-          0 bs))
-
-(defn- int->bytes
-  "Convert an integer to big-endian bytes"
-  [n]
-  [(bit-and (unsigned-bit-shift-right n 24) 0xFF)
-   (bit-and (unsigned-bit-shift-right n 16) 0xFF)
-   (bit-and (unsigned-bit-shift-right n 8) 0xFF)
-   (bit-and n 0xFF)])
-
 (defn- find-highest-bit
   "Find the highest bit in an integer"
   [n]

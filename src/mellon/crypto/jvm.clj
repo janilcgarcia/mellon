@@ -11,17 +11,18 @@
 
   (:require [clojure.core.async :as async
              :refer [<! >! go-loop go chan close!]]
-            [mellon.crypto.core :as c.core]))
+            [mellon.crypto.core :as c.core]
+            [mellon.utils :refer [int->bytes]]))
 
-(defn- make-digest-jca-api
+(defn- make-digest-with-digest
   [digest message]
   (let [out (byte-array (.getDigestLength digest))]
     (-> (doto digest
-          (.update (byte-array message)))
+          (.update (byte-array message) 0 (count message)))
         (.digest)
         vec)))
 
-(defn- make-digest-bc-api
+(defn- make-digest-with-do-final
   [digest message length]
   (let [out (byte-array length)]
     (doto digest
@@ -30,122 +31,70 @@
     (vec out)))
 
 (defn keyed-blake2b
-  "Keyed version of the BLAKE2b algorithm. Optimal in 64-bit processors.
-  Calculates the hash and returns by the callback f"
-  ([key message] (fn [f] (keyed-blake2b key message f)))
-  ([key message f]
-   (if (> (count key) 64)
-     (recur nil key
-            (fn [key]
-              (keyed-blake2b key message f)))
-     (-> (Blake2bDigest.
-          (if (nil? key)
-            nil
-            (byte-array key))
-          64 nil nil)
-         (make-digest-bc-api message 64)
-         f))))
+  "Keyed version of the BLAKE2b algorithm. Optimal in 64-bit processors."
+  [key message]
+  (cond
+    (empty? key) (-> (Blake2bDigest.) (make-digest-with-do-final message 64))
+    (> (count key) 64) (recur (keyed-blake2b nil key) message)
+    :otherwise (-> (Blake2bDigest. (byte-array key) 64 nil nil)
+                   (make-digest-with-do-final message 64))))
 
 (defn keyed-blake2s
-  "Keyed version of the BLAKE2s algorithm. Optimal in 32-bit processors.
-  Calculates the hash and returns by the callback f."
-  ([key message] (fn [f] (keyed-blake2s key message f)))
-  ([key message f]
-   (if (> (count key) 32)
-     (recur nil key
-            (fn [key]
-              (keyed-blake2s key message 32 f)))
-     (-> (Blake2sDigest.
-          (if (nil? key)
-            nil
-            (byte-array key))
-          32 nil nil)
-         (make-digest-bc-api message 32)
-         f))))
+  "Keyed version of the BLAKE2s algorithm. Optimal in 32-bit processors."
+  [key message]
+  (cond
+    (empty? key) (-> (Blake2bDigest.) (make-digest-with-do-final message 32))
+    (> (count key) 64) (recur (keyed-blake2s nil key) message)
+    :otherwise (-> (Blake2bDigest. (byte-array key) 32 nil nil)
+                   (make-digest-with-do-final message 32))))
 
 (defn- hmac-sha2
   "Generates a HMAC for a SHA2 algorithm using the JCA algorithms which can
   be hardware accelerated. The first argument is the JCA name of the digest
   algorithm."
-  [sha key message f]
+  [sha key message]
   (let [hmac-name (str "Hmac" sha)
         hmac (doto
                  (Mac/getInstance hmac-name)
                (.init (SecretKeySpec. (byte-array key) hmac-name)))]
-    (f (make-digest-bc-api hmac message (.getMacLength hmac)))))
+    (make-digest-with-do-final hmac message (.getMacLength hmac))))
 
 (defn hmac-sha2-512
-  "Calculates the HMAC with the SHA512 algorithm on the key and message passed.
-  Returns by calling the callback f."
-  ([key message] (fn [f] (hmac-sha2-512 key message f)))
-  ([key message f]
-   (hmac-sha2 "SHA512" key message f)))
+  "Calculates the HMAC with the SHA512 algorithm on the key and message
+  passed."
+  [key message]
+  (hmac-sha2 "SHA512" key message))
 
 (defn hmac-sha2-256
-  "Calculates the HMAC with the SHA256 algorithm on the key and message passed.
-  Returns by calling the callback f."
-  ([key message] (fn [f] (hmac-sha2-256 key message f)))
-  ([key message f]
-   (hmac-sha2 "SHA256" key message f)))
+  "Calculates the HMAC with the SHA256 algorithm on the key and message
+  passed."
+  [key message]
+  (hmac-sha2 "SHA256" key message))
 
 (defn- keyed-sha3
   "Prefix key MAC using SHA3. It is non-standard but entirely secure with the
   SHA3 construction. Also uses the JCA implementaiton for hardware acceleration
   when available. Consider using KMAC whenever JCA makes that available."
-  [length key message f]
+  [length key message]
   (let [digest (doto
                    (MessageDigest/getInstance (str "SHA3-" length))
                  (.update (byte-array key)))]
-    
-    (f (make-digest-jca-api digest message))))
+
+    (make-digest-with-digest digest message)))
 
 (defn keyed-sha3-512
   "Calculates the MAC of the message using SHA3-512 in prefix mode using the
   key. Although Prefix MAC using SHA3 is not standard, it is secure by the
-  definition of SHA3.
-  Returns by calling f with the digest"
-  ([key message] (fn [f] (keyed-sha3-512 key message f)))
-  ([key message f]
-   (keyed-sha3 "512" key message f)))
+  definition of SHA3."
+  [key message]
+  (keyed-sha3 "512" key message))
 
 (defn keyed-sha3-256
   "Calculates the MAC of the message using SHA3-256 in prefix mode using the
   key. Although Prefix MAC using SHA3 is not standard, it is secure by the
-  definition of SHA3.
-  Returns by calling f with the digest"
-  ([key message] (fn [f] (keyed-sha3-256 key message f)))
-  ([key message f]
-   (keyed-sha3 "256" key message f)))
-
-(def keyed-blake2b-spec
-  "Spec for the BLAKE2b algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 64
-   :fn keyed-blake2b})
-
-(def keyed-blake2s-spec
-  "Spec for the BLAKE2s algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 32
-   :fn keyed-blake2s})
-
-(def hmac-sha2-512-spec
-  "Spec for the HMAC-SHA-256 algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 64
-   :fn hmac-sha2-512})
-
-(def hmac-sha2-256-spec
-  "Spec for the HMAC-SHA-256 algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 32
-   :fn hmac-sha2-256})
-
-(def keyed-sha3-512-spec
-  "Spec for the SHA3-512 algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 64
-   :fn keyed-sha3-512})
-
-(def keyed-sha3-256-spec
-  "Spec for the SHA2-256 algorithm. Specs contain metadata for the algorithm."
-  {:max-digest-size 32
-   :fn keyed-sha3-256})
+  definition of SHA3."
+  [key message]
+  (keyed-sha3 "256" key message))
 
 (defn- secure-random
   ([] (secure-random nil))
@@ -155,15 +104,32 @@
      (java.security.SecureRandom/getInstance algo))))
 
 (defn- system-random-next-bytes
-  ([rand] (fn [nbytes f] (system-random-next-bytes rand nbytes f)))
-  ([rand nbytes f]
+  ([rand] (fn [nbytes] (system-random-next-bytes rand nbytes)))
+  ([rand nbytes]
    (let [bytes (byte-array nbytes)]
      (.nextBytes rand bytes)
-     (f (vec bytes)))))
+     (vec bytes))))
 
 (defn system-random
+  "Creates a system random CSPRBG generation function. Uses the system crypto
+  random to gather bytes in each call, so it is mutable and does not hold
+  referential transparency."
   ([] (system-random nil))
   ([algo]
    (let [r (secure-random algo)]
      (system-random-next-bytes r))))
 
+(defn extended-keyed-hash
+  "Hash the message using the key put produces a hash of variable size which
+  can be bigger than the digest output of the original hash.
+  hash must be a keyed hash function which takes in order key and message and
+  produces a sequence of bytes."
+  [hash key message length]
+  (loop [H (hash key (concat (int->bytes length) [0] message))
+         n 0
+         bs []]
+    (if (>= n length)
+      (take length (->> bs (map vec) flatten))
+      (recur (hash key (concat [1] H))
+             (+ n (count H))
+             (conj bs H)))))
