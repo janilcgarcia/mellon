@@ -1,4 +1,4 @@
-(ns mellon.core
+(ns mellon.cli
   (:gen-class)
   (:require [clojure.tools.cli :as cli]
             [clojure.java.io :as io]
@@ -8,6 +8,10 @@
             [clojure.core.async :as async :refer [<!!]]
             [mellon.crypto.jvm :as crypto]
             [mellon.utils :as utils]))
+
+(defn load-dict
+  [file-name]
+  (vec (s/split (slurp file-name) #"\n")))
 
 (defn- file-or-stdout
   [file-name]
@@ -101,7 +105,7 @@
         system-prbg (m.rand/->system-prbg (utils/fn-to-chan
                                            (crypto/system-random)))
         pp-gen (partial m.gen/generate-passphrase system-prbg
-                        (m.gen/load-dict (:dict options)))]
+                        (load-dict (:dict options)))]
     (dotimes [_ (:number options)]
       (println (<!! (pp-gen (:length options)))))))
 

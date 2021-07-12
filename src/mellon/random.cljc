@@ -1,8 +1,8 @@
 (ns mellon.random
-  (:require [clojure.core.async :as async :refer [go-loop go <! >! chan close!]])
-  (:require [mellon.native-utils :as native]
-            [mellon.utils :refer [bytes->long
-                                  int->bytes]]))
+  (:require
+   [clojure.core.async :as async :refer [go-loop go <! >! chan close!]]
+   [mellon.native-utils :as native]
+   [mellon.utils :refer [bytes->long int->bytes]]))
 
 ;; CSPRBGs
 (defn- connect-hash-prbg

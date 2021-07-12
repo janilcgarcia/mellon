@@ -1,0 +1,6 @@
+{:paths ["src"]
+ :deps {safelydysfunctionl.gitlab.io/mellon-jvm {:local/root "../jvm"}
+        cljfx/cljfx {:mvn/version "1.7.14"}}
+ :aliases
+ {:run
+  {:main-opts ["-m" "mellon.javafx"]}}}

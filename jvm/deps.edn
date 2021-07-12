@@ -1,0 +1,7 @@
+{:paths ["src"]
+ :deps {org.bouncycastle/bcprov-jdk15on {:mvn/version "1.69"}
+        org.clojure/tools.cli {:mvn/version "1.0.206"}
+        safelydysfunctionl.gitlab.io/mellon-core {:local/root ".."}}
+ :aliases
+ {:run
+  {:main-opts ["-m" "mellon.cli"]}}}

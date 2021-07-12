@@ -3,10 +3,6 @@
             [mellon.random :as m.random]
             [clojure.core.async :as async :refer [<! go go-loop]]))
 
-(defn load-dict
-  [file]
-  (s/split-lines (slurp file)))
-
 (defn generate-passphrase
   [prbg dict length]
   (go-loop [words []]

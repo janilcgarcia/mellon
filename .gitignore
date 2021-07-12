@@ -15,3 +15,6 @@ pom.xml.asc
 *ipynb*
 *.txt
 *.dict
+.cpcache
+out/
+.nrepl-port
